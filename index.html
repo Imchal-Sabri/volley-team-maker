@@ -814,6 +814,47 @@ function goToTab(name){
 }
 
 /* ================================================================
+   ANTI-COLLISION — relire les données fraîches juste avant d'écrire,
+   pour réduire au minimum la fenêtre où deux personnes pourraient
+   s'écraser mutuellement (chaque mutation part de l'état serveur
+   le plus récent possible, pas de l'état chargé à l'ouverture).
+   ================================================================ */
+async function fetchFreshPlayers(){
+  if(API_URL.startsWith("REMPLACER")) return players;
+  try{
+    const res = await fetch(API_URL + "?action=load");
+    const data = await res.json();
+    return data.players || [];
+  }catch(e){ return players; }
+}
+async function fetchFreshHistory(){
+  if(API_URL.startsWith("REMPLACER")) return history;
+  try{
+    const res = await fetch(API_URL + "?action=load");
+    const data = await res.json();
+    return data.history || [];
+  }catch(e){ return history; }
+}
+
+/** Applique `mutatorFn` sur la liste de joueurs la plus fraîche possible,
+ *  puis sauvegarde. mutatorFn reçoit le tableau frais et doit retourner
+ *  le nouveau tableau. */
+async function mutatePlayers(mutatorFn){
+  const fresh = await fetchFreshPlayers();
+  players = mutatorFn(fresh.slice());
+  renderAll();
+  return saveToServer({players});
+}
+
+/** Idem pour l'historique. */
+async function mutateHistory(mutatorFn){
+  const fresh = await fetchFreshHistory();
+  history = mutatorFn(fresh.slice());
+  if(document.getElementById("panel-history").classList.contains("active")) renderHistory();
+  return saveToServer({history});
+}
+
+/* ================================================================
    RENDER : JOUEURS
    ================================================================ */
 function renderPlayers(){
@@ -854,19 +895,21 @@ document.getElementById("btnAddPlayer").onclick = ()=>{
   const level = parseInt(document.getElementById("pLevel").value);
   const gender = document.querySelector("#pGenderSeg button.sel").dataset.val;
   withPassword("Ajouter un joueur", async ()=>{
-    players.push({name, level, gender});
     document.getElementById("pName").value = "";
-    renderAll();
-    await saveToServer({players});
+    await mutatePlayers(fresh=>{
+      if(fresh.some(p=>p.name.toLowerCase()===name.toLowerCase())){
+        alert(`"${name}" a déjà été ajouté entre-temps par quelqu'un d'autre.`);
+        return fresh;
+      }
+      return fresh.concat([{name, level, gender}]);
+    });
   });
 };
 
 window.deletePlayer = function(name){
   withPassword("Supprimer un joueur", async ()=>{
     if(!confirm(`Supprimer ${name} ?`)) return;
-    players = players.filter(p=>p.name!==name);
-    renderAll();
-    await saveToServer({players});
+    await mutatePlayers(fresh=>fresh.filter(p=>p.name!==name));
   });
 };
 
@@ -880,10 +923,12 @@ window.editPlayer = function(name){
     if(![1,2,3,4].includes(lvlNum)){ alert("Niveau invalide."); return; }
     const gen = prompt("Genre (H ou F) :", p.gender==="F"?"F":"H");
     if(gen===null) return;
-    p.level = lvlNum;
-    p.gender = gen.toUpperCase()==="F" ? "F" : "M";
-    renderAll();
-    saveToServer({players});
+    const newGender = gen.toUpperCase()==="F" ? "F" : "M";
+    mutatePlayers(fresh=>{
+      const target = fresh.find(x=>x.name===name);
+      if(target){ target.level = lvlNum; target.gender = newGender; }
+      return fresh;
+    });
   });
 };
 
@@ -894,21 +939,22 @@ document.getElementById("btnDoImport").onclick = ()=>{
   const raw = document.getElementById("importText").value.trim();
   if(!raw) return;
   withPassword("Importer des joueurs", async ()=>{
-    const lines = raw.split("\n").map(l=>l.trim()).filter(Boolean);
-    let added=0, errors=[];
-    lines.forEach((line,i)=>{
-      const parts = line.split(/[,;]/).map(s=>s.trim());
-      if(parts.length<2){ errors.push("Ligne "+(i+1)+" ignorée"); return; }
-      const name=parts[0], level=parseInt(parts[1]);
-      if(!name||isNaN(level)||level<1||level>4){ errors.push("Ligne "+(i+1)+" invalide"); return; }
-      const gender = parts[2] && parts[2].toUpperCase().startsWith("F") ? "F" : "M";
-      if(players.some(p=>p.name.toLowerCase()===name.toLowerCase())){ errors.push("Doublon: "+name); return; }
-      players.push({name, level, gender}); added++;
-    });
     document.getElementById("importText").value="";
     document.getElementById("importBox").classList.add("hidden");
-    renderAll();
-    await saveToServer({players});
+    let added=0, errors=[];
+    await mutatePlayers(fresh=>{
+      const lines = raw.split("\n").map(l=>l.trim()).filter(Boolean);
+      lines.forEach((line,i)=>{
+        const parts = line.split(/[,;]/).map(s=>s.trim());
+        if(parts.length<2){ errors.push("Ligne "+(i+1)+" ignorée"); return; }
+        const name=parts[0], level=parseInt(parts[1]);
+        if(!name||isNaN(level)||level<1||level>4){ errors.push("Ligne "+(i+1)+" invalide"); return; }
+        const gender = parts[2] && parts[2].toUpperCase().startsWith("F") ? "F" : "M";
+        if(fresh.some(p=>p.name.toLowerCase()===name.toLowerCase())){ errors.push("Doublon: "+name); return; }
+        fresh.push({name, level, gender}); added++;
+      });
+      return fresh;
+    });
     alert(added+" joueur(s) importé(s)."+(errors.length?"\n\n"+errors.join("\n"):""));
   });
 };
@@ -959,9 +1005,11 @@ function renderRank(){
 window.rankMove = function(i, dir){
   const j = i+dir;
   if(j<0||j>=players.length) return;
-  [players[i],players[j]] = [players[j],players[i]];
-  renderRank();
-  saveToServer({players});
+  withPassword("Modifier le classement", ()=>{
+    [players[i],players[j]] = [players[j],players[i]];
+    renderRank();
+    saveToServer({players});
+  });
 };
 
 /* ================================================================
@@ -1284,8 +1332,8 @@ document.getElementById("btnResetConfig").onclick = ()=>{
 document.getElementById("btnValidateConfig").onclick = ()=>{
   withPassword("Valider la composition", async ()=>{
     const present = players.filter(p=>presentSet.has(p.name));
-    saveSession(present, configs[currentCfgIdx].label);
-    await saveToServer({history});
+    const session = buildSessionObject(present, configs[currentCfgIdx].label);
+    await mutateHistory(fresh=>[session].concat(fresh).slice(0,10));
     document.getElementById("resultsOverlay").classList.remove("active");
     alert(`"${configs[currentCfgIdx].label}" sauvegardée comme composition retenue.`);
     goToTab("history");
@@ -1294,13 +1342,13 @@ document.getElementById("btnValidateConfig").onclick = ()=>{
 document.getElementById("btnSaveAllConfigs").onclick = ()=>{
   withPassword("Sauvegarder la séance", async ()=>{
     const present = players.filter(p=>presentSet.has(p.name));
-    saveSession(present, null);
-    await saveToServer({history});
+    const session = buildSessionObject(present, null);
+    await mutateHistory(fresh=>[session].concat(fresh).slice(0,10));
     alert("Toutes les compositions sauvegardées. Choisissez la composition retenue dans l'Historique.");
   });
 };
 
-function saveSession(present, chosenLabel){
+function buildSessionObject(present, chosenLabel){
   const session = {
     date: new Date().toISOString(),
     nbTeams: configs[0].nTeams,
@@ -1318,8 +1366,7 @@ function saveSession(present, chosenLabel){
     const chosen = session.configs.find(c=>c.label===chosenLabel);
     if(chosen) session.configs = [chosen];
   }
-  history.unshift(session);
-  history = history.slice(0,10);
+  return session;
 }
 
 document.getElementById("btnExportCsvResults").onclick = ()=>{
@@ -1402,34 +1449,39 @@ window.toggleHistDetail = function(idx){
 };
 
 window.chooseHistConfig = function(idx, label){
+  const targetDate = history[idx].date;
   withPassword("Choisir la composition", async ()=>{
-    const s = history[idx];
-    const chosen = s.configs.find(c=>c.label===label);
-    s.chosenLabel = label;
-    if(chosen) s.configs = [chosen];
-    await saveToServer({history});
-    renderHistory();
+    await mutateHistory(fresh=>{
+      const s = fresh.find(x=>x.date===targetDate);
+      if(s){
+        const chosen = s.configs.find(c=>c.label===label);
+        s.chosenLabel = label;
+        if(chosen) s.configs = [chosen];
+      }
+      return fresh;
+    });
   });
 };
 
 window.deleteHistSession = function(idx){
+  const targetDate = history[idx].date;
+  const dt = new Date(targetDate).toLocaleString("fr-FR");
   withPassword("Supprimer une séance", async ()=>{
-    const dt = new Date(history[idx].date).toLocaleString("fr-FR");
     if(!confirm(`Supprimer la séance du ${dt} ?`)) return;
-    history.splice(idx,1);
-    await saveToServer({history});
-    renderHistory();
+    await mutateHistory(fresh=>fresh.filter(x=>x.date!==targetDate));
   });
 };
 
 window.reloadFromHistory = function(idx){
   const s = history[idx];
-  const existing = new Set(players.map(p=>p.name));
-  s.players.forEach(p=>{ if(!existing.has(p.name)) players.push(Object.assign({},p)); });
-  presentSet = new Set(s.players.map(p=>p.name));
   withPassword("Recharger des joueurs", async ()=>{
-    renderAll();
-    await saveToServer({players});
+    await mutatePlayers(fresh=>{
+      const existing = new Set(fresh.map(p=>p.name));
+      s.players.forEach(p=>{ if(!existing.has(p.name)) fresh.push(Object.assign({},p)); });
+      return fresh;
+    });
+    presentSet = new Set(s.players.map(p=>p.name));
+    renderSessionTab();
     goToTab("session");
   });
 };
