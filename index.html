@@ -981,7 +981,7 @@ function renderPresence(){
     grid.innerHTML = `<div class="empty-state"><span class="ic">👥</span>Ajoutez des joueurs d'abord.</div>`;
     return;
   }
-  if(presentSet.size===0 && players.length) players.forEach(p=>presentSet.add(p.name));
+  // Par defaut, aucun joueur n'est coche (l'utilisateur choisit les presents)
   grid.innerHTML = sorted.map(p=>`
     <label class="presence-item">
       <input type="checkbox" data-name="${escAttr(p.name)}" ${presentSet.has(p.name)?"checked":""}>
